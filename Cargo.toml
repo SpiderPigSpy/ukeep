@@ -1,0 +1,14 @@
+[package]
+name = "ukeep"
+version = "0.1.0"
+authors = ["Alex <busarovalex@yandex.ru>"]
+
+[dependencies]
+env_logger = "0.4.0"
+log = "0.3.6"
+atarashii_imap = "0.2.1"
+openssl = "*"
+quick-error = "*"
+clap = "2.20.3"
+[dependencies.imap]
+path = "/home/alex/Rust/rust-imap"
