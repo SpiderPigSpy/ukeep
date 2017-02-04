@@ -11,46 +11,44 @@ use imap::client::Client;
 use std::net::{TcpStream};
 use std::sync::mpsc::*;
 use std::fs::File;
+use std::sync::Mutex;
+use std::rc::Rc;
 
 fn main() {
     env_logger::init().unwrap();
-    let (host, username, password, email_folder, output_folder) = input_parameters();
+    let (host, username, password, email_folder, output_folder, starting_number) = input_parameters();
 
     let mut imap_socket = imap_client(&host, &username, &password);
     let inbox = imap_socket.select(&email_folder).unwrap();
     debug!("{}", &inbox);
-    let total_messages = inbox.exists;
 
     let saver = EmailSaver::new(&output_folder);
 
-    for i in 1..total_messages + 1 {
-        debug!("Loading email {}", i);
-        match (
-            header_from(i, &mut imap_socket), 
-            header_to(i, &mut imap_socket),
-            header_subject(i, &mut imap_socket),
-            body(i, &mut imap_socket)
-        ) {
-            (Some(from), Some(to), Some(subject), Some(body)) => {
-                saver.save(Email{
-                    number: i,
-                    from: from,
-                    to: to,
-                    subject: subject,
-                    body: body
-                });
-            },
-            (from, to, subject, body) => error!(
-                "fail: from={}, to={}, subject={}, body={}", 
-                from.is_some(), 
-                to.is_some(), 
-                subject.is_some(),
-                body.is_some()
-            )
+    for email in imap_socket.into_email_iter(&email_folder)
+        .skip(starting_number)
+        .filter(from_or_to_ukeep)
+        .flat_map(into_email) {
+            saver.save(email);
+    }
+}
+
+fn from_or_to_ukeep(email_provider: &EmailProvider) -> bool {
+    match (email_provider.to(), email_provider.from()) {
+        (Ok(to), Ok(from)) => {
+            to.contains("ukeep") || from.contains("ukeep")
+        },
+        _ => false
+    }
+}
+
+fn into_email(email_provider: EmailProvider) -> Option<Email> {
+    match email_provider.email() {
+        Ok(email) => Some(email),
+        Err(err) => {
+            error!("{}", err);
+            None
         }
     }
-
-    imap_socket.logout().unwrap();
 }
 
 fn imap_client(host: &str, username: &str, password: &str) -> ImapClient {
@@ -68,6 +66,88 @@ fn imap_client(host: &str, username: &str, password: &str) -> ImapClient {
     }
 
     imap_socket
+}
+
+trait EmailIter {
+    fn into_email_iter(self, folder_name: &str) -> EmailFolderIterator;
+}
+
+impl EmailIter for ImapClient {
+    fn into_email_iter(self, folder_name: &str) -> EmailFolderIterator {
+        EmailFolderIterator::new(self, folder_name)
+    }
+}
+
+struct EmailFolderIterator {
+    imap: Rc<Mutex<ImapClient>>,
+    total_messages: u32,
+    current_message: u32
+}
+
+impl EmailFolderIterator {
+    fn new(mut imap: ImapClient, email_folder: &str) -> EmailFolderIterator {
+        let total_messages = imap.select(email_folder).unwrap().exists;
+        EmailFolderIterator {
+            imap: Rc::new(Mutex::new(imap)),
+            total_messages: total_messages,
+            current_message: 0
+        }
+    }
+}
+
+impl Iterator for EmailFolderIterator {
+    type Item = EmailProvider;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_message >= self.total_messages {
+            return None;
+        }
+        self.current_message += 1;
+        Some(EmailProvider::new(self.imap.clone(), self.current_message))
+    }
+}
+
+struct EmailProvider {
+    imap: Rc<Mutex<ImapClient>>,
+    number: u32
+}
+
+impl EmailProvider {
+    fn new(imap: Rc<Mutex<ImapClient>>, email_number: u32) -> EmailProvider {
+        EmailProvider {
+            imap: imap,
+            number: email_number
+        }
+    }
+
+    fn from(&self) -> Result<FileContent, EmailError> {
+        trace!("fetching 'from': {}", self.number);
+        header_from(self.number, &mut *self.imap.lock().unwrap()).ok_or(EmailError::FailedFetch)
+    }
+
+    fn to(&self) -> Result<FileContent, EmailError> {
+        trace!("fetching 'to': {}", self.number);
+        header_to(self.number, &mut *self.imap.lock().unwrap()).ok_or(EmailError::FailedFetch)
+    }
+
+    fn subject(&self) -> Result<FileContent, EmailError> {
+        trace!("fetching 'subject': {}", self.number);
+        header_subject(self.number, &mut *self.imap.lock().unwrap()).ok_or(EmailError::FailedFetch)
+    }
+
+    fn body(&self) -> Result<FileContent, EmailError> {
+        trace!("fetching 'body': {}", self.number);
+        body(self.number, &mut *self.imap.lock().unwrap()).ok_or(EmailError::FailedFetch)
+    }
+
+    fn email(&self) -> Result<Email, EmailError> {
+        Ok(Email {
+            number: self.number,
+            from: self.from()?,
+            to: self.to()?,
+            subject: self.subject()?,
+            body: self.body()?
+        })
+    }
 }
 
 struct Email {
@@ -149,6 +229,12 @@ type ImapClient = Client<SslStream<TcpStream>>;
 
 struct FileContent(Vec<String>);
 
+impl FileContent {
+    fn contains(&self, substring: &str) -> bool {
+        self.0.iter().any(|s| s.contains(substring))
+    }
+}
+
 fn write_all(mut file: File, content: FileContent) -> Result<(), EmailError> {
     use std::io::Write;
     for line in content.0 {
@@ -160,13 +246,14 @@ fn write_all(mut file: File, content: FileContent) -> Result<(), EmailError> {
 quick_error! {
     #[derive(Debug)]
     enum EmailError {
+        FailedFetch
         Io(err: ::std::io::Error) {
             from()
         }
     }
 }
 
-fn input_parameters() -> (String, String, String, String, String) {
+fn input_parameters() -> (String, String, String, String, String, usize) {
     use clap::{Arg, App};
     let matches = App::new("Ukeep download")
         .arg(Arg::with_name("host")   
@@ -199,11 +286,18 @@ fn input_parameters() -> (String, String, String, String, String) {
                 .long("output")
                 .value_name("OUTPUT_FOLDER_NAME")
                 .takes_value(true))
+        .arg(Arg::with_name("starting")   
+                .short("s")
+                .long("starting")
+                .value_name("STARTING_EMAIL_NUMBER")
+                .takes_value(true))
         .get_matches();
     let host = matches.value_of("host").unwrap().to_owned();
     let username = matches.value_of("username").unwrap().to_owned();
     let password = matches.value_of("password").unwrap().to_owned();
     let folder = matches.value_of("folder").unwrap().to_owned();
     let output = matches.value_of("output").map(str::to_owned).unwrap_or(folder.clone());
-    (host, username, password, folder, output)
+    use std::str::FromStr;
+    let starting_number = matches.value_of("starting").map(|s| usize::from_str(s).unwrap()).unwrap_or(0);
+    (host, username, password, folder, output, starting_number)
 }
