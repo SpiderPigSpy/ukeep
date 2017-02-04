@@ -11,4 +11,4 @@ openssl = "*"
 quick-error = "*"
 clap = "2.20.3"
 [dependencies.imap]
-path = "/home/alex/Rust/rust-imap"
+git = "https://github.com/SpiderPigSpy/rust-imap.git"
